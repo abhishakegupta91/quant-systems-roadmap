@@ -1,0 +1,21 @@
+# Secrets
+.env
+*.env
+.env.*
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local progress (uncomment if you want to keep your personal tracker private)
+# progress/my-progress.md
