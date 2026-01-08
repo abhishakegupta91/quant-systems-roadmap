@@ -1,4 +1,4 @@
-# Elite Fintech Architect Study Plan
+# Quant Systems Roadmap
 ## 16-Week Intensive Program for Staff-Level Trading Systems Engineer
 
 **Prepared for:** Abhishake Gupta — 12+ years Python/Backend, BTech ECE, IB API experience  

@@ -1,6 +1,6 @@
-# Elite Fintech Architect Study Plan (16 Weeks)
+# Quant Systems Roadmap (16 Weeks)
 
-A plan-only, docs-first curriculum to level up into a **Staff-Level Trading Systems / Fintech Architect**, with an India-market focus (NSE/BSE) and global applicability.
+A 16-week, plan-only curriculum to become a Staff-Level Trading Systems / Fintech Architect. Covers exchange mechanics, low-latency design, SEBI compliance, risk engines, and a production-grade Indian market trading platform capstone.
 
 ## How to use this repo
 
