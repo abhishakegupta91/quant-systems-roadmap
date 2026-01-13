@@ -1,7 +1,6 @@
 # Quant Systems Roadmap
 ## 16-Week Intensive Program for Staff-Level Trading Systems Engineer
-
-**Prepared for:** Abhishake Gupta — 12+ years Python/Backend, BTech ECE, IB API experience  
+ 
 **Target Role:** Hybrid Staff Engineer (Trading Platform + Quant Development)  
 **Target Market:** Indian Markets (NSE/BSE) with global applicability  
 **Duration:** 16 weeks (~4 months) | 2-3 hours/day (~15-20 hrs/week)  
