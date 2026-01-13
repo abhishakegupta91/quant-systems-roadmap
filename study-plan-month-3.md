@@ -1,7 +1,6 @@
 # Elite Fintech Architect Study Plan
 ## Month 3: Compliance, Security & Quantitative Logic
-
-**Prepared for:** Abhishake Gupta — 12+ years Python/Backend, BTech ECE, IB API experience  
+ 
 **Target Role:** Hybrid Staff Engineer (Trading Platform + Quant Development)  
 **Target Market:** Indian Markets (NSE/BSE) with global applicability  
 **Duration:** Weeks 9-12 | 2-3 hours/day (~15-20 hrs/week)  
