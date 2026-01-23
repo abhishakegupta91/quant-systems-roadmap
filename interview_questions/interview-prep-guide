@@ -1,0 +1,2213 @@
+# Turing Backend Engineer Interview Preparation Guide
+
+## Table of Contents
+1. [Core Concepts Explained](#core-concepts)
+2. [Token Bucket & Rate Limiting](#token-bucket--rate-limiting)
+3. [System Design: Video Streaming](#system-design-video-streaming)
+4. [JIRA-like Service](#jira-like-service)
+5. [AWS S3 Multipart Upload](#aws-s3-multipart-upload)
+6. [Distributed Systems Concepts](#distributed-systems-concepts)
+7. [Common Distributed Systems Problems & Solutions](#common-distributed-systems-problems--solutions)
+8. [Essential Algorithms for Backend](#essential-algorithms-for-backend)
+9. [Interview Practice Questions](#interview-practice-questions)
+
+---
+
+# CORE CONCEPTS EXPLAINED
+
+## 1. Token Bucket Algorithm
+
+### What is it?
+A simple, elegant way to control how many requests are allowed per second while still allowing short bursts of traffic.
+
+### How it works (imagine a bucket with tokens)
+
+- **Bucket capacity:** Think of a bucket that can hold max 100 tokens.
+- **Refill rate:** Tokens are added to the bucket at a fixed rate, like 5 tokens per second.
+- **Request processing:** Every incoming request needs 1 token to pass through:
+  - If tokens available → request passes, 1 token removed.
+  - If no tokens → request rejected or delayed until tokens refill.
+
+### Why it's useful
+
+- **Enforces average rate:** Over time, you can send exactly 5 requests/second on average.
+- **Allows bursts:** If you were idle for 20 seconds, the bucket accumulated 100 tokens, so you can suddenly send 100 requests at once (up to bucket capacity).
+- **Fair and predictable:** Unlike some rate limiting, token bucket is fair across users.
+
+### How to implement in Python
+
+```python
+import time
+
+class TokenBucket:
+    def __init__(self, capacity, refill_rate):
+        self.capacity = capacity  # max tokens in bucket
+        self.refill_rate = refill_rate  # tokens per second
+        self.tokens = capacity  # start with full bucket
+        self.last_refill_time = time.time()
+    
+    def allow_request(self):
+        # Calculate how many tokens to add since last refill
+        now = time.time()
+        elapsed = now - self.last_refill_time
+        self.tokens = min(
+            self.capacity,
+            self.tokens + elapsed * self.refill_rate
+        )
+        self.last_refill_time = now
+        
+        # Check if we have tokens
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+# Usage
+limiter = TokenBucket(capacity=100, refill_rate=5)  # 5 requests/sec
+if limiter.allow_request():
+    print("Request allowed!")
+else:
+    print("Rate limit exceeded. Try again later.")
+```
+
+### Key parameters to mention in interview
+- **Capacity (C):** Max burst size. If capacity=100 and refill_rate=10, you can send 100 requests instantly, then must wait for refill.
+- **Refill rate (R):** Average requests per second allowed. If R=10, on average 10 requests/second are allowed.
+
+### Where to implement
+- **API Gateway:** Per client IP or API key.
+- **Service level:** Per user or per tenant.
+- **Storage:** In-memory (single machine) or Redis (distributed).
+
+---
+
+## 2. Rate Limiting
+
+### What is it?
+Controlling how many requests a user/service can make in a time window to protect your backend from overload and enforce fair usage.
+
+### Common strategies
+
+#### Fixed Window
+- Allow N requests per fixed window (e.g., 100 requests per minute).
+- Simple but has edge cases: at boundary between windows, users might send 2× requests.
+
+#### Sliding Window
+- Track requests over last rolling interval (e.g., last 60 seconds).
+- Smoother limiting, but more complex to implement.
+
+#### Token Bucket (recommended)
+- Most flexible: enforces average rate with burst allowance.
+- See above section for details.
+
+### How to implement rate limiting with Redis (distributed)
+
+For multiple servers behind a load balancer, use Redis to maintain shared token state:
+
+```python
+import redis
+import time
+
+class DistributedRateLimiter:
+    def __init__(self, redis_client, capacity, refill_rate):
+        self.redis = redis_client
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+    
+    def allow_request(self, user_id):
+        key = f"rate_limit:{user_id}"
+        
+        # Lua script to atomically update tokens in Redis
+        lua_script = """
+        local key = KEYS[1]
+        local capacity = tonumber(ARGV[1])
+        local refill_rate = tonumber(ARGV[2])
+        local now = tonumber(ARGV[3])
+        
+        local data = redis.call('HGETALL', key)
+        local tokens = tonumber(data[2]) or capacity
+        local last_refill = tonumber(data[4]) or now
+        
+        local elapsed = math.max(0, now - last_refill)
+        tokens = math.min(capacity, tokens + elapsed * refill_rate)
+        
+        if tokens >= 1 then
+            tokens = tokens - 1
+            redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
+            redis.call('EXPIRE', key, 3600)
+            return 1
+        else
+            redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
+            redis.call('EXPIRE', key, 3600)
+            return 0
+        end
+        """
+        
+        result = self.redis.eval(lua_script, 1, key, self.capacity, self.refill_rate, time.time())
+        return result == 1
+
+# Usage
+redis_client = redis.StrictRedis(host='localhost', port=6379)
+limiter = DistributedRateLimiter(redis_client, capacity=100, refill_rate=5)
+
+if limiter.allow_request(user_id="user123"):
+    print("Request allowed")
+else:
+    print("HTTP 429: Too Many Requests")
+```
+
+### Response patterns
+
+When rate limit is exceeded:
+- **HTTP Status:** Return `429 Too Many Requests`.
+- **Headers:** Include `Retry-After` header to tell client when to retry.
+- **Message:** Include reset time in response body or headers.
+
+```python
+response_headers = {
+    'Retry-After': '60',  # Retry after 60 seconds
+    'X-RateLimit-Limit': '100',
+    'X-RateLimit-Remaining': '0',
+    'X-RateLimit-Reset': '1641234567',
+}
+```
+
+---
+
+## 3. Design a Video Streaming Platform
+
+### Requirements (clarify these first)
+
+**Functional Requirements:**
+- Users can upload videos.
+- Users can watch videos with playback controls (play, pause, seek).
+- Basic metadata: title, description, thumbnail, duration.
+- Multiple video resolutions (adaptive bitrate streaming).
+
+**Non-Functional Requirements:**
+- Scale to millions of concurrent users.
+- Low playback latency (start streaming in <2 seconds).
+- Cost-efficient storage (videos are large).
+- 99.9% availability.
+- Support for uploads up to several GB.
+
+### High-level architecture
+
+```
+[User Client]
+      ↓
+[API Gateway / Auth]
+      ↓
+[Backend Service] ← [Database (metadata)]
+      ↓
+[S3 / Object Storage]
+      ↓
+[Transcoding Queue (RabbitMQ/Kafka)]
+      ↓
+[Worker Service] (converts to multiple formats)
+      ↓
+[S3 Output / HLS Segments]
+      ↓
+[CDN (CloudFront/Akamai)]
+      ↓
+[User Client] (plays adaptive video)
+```
+
+### Key components
+
+#### 1. Upload Pipeline
+
+**Direct-to-S3 Upload (recommended):**
+- Backend generates a **pre-signed S3 URL** valid for 15 minutes.
+- Client uploads directly to S3 (bypasses backend, faster).
+- S3 triggers an event notification when upload completes.
+- Backend enqueues a transcoding job.
+
+**Backend Flow:**
+```python
+import boto3
+
+def get_upload_url(video_id, user_id):
+    s3_client = boto3.client('s3')
+    
+    # Generate pre-signed URL
+    presigned_url = s3_client.generate_presigned_url(
+        'put_object',
+        Params={
+            'Bucket': 'videos-raw',
+            'Key': f'uploads/{user_id}/{video_id}/video.mp4'
+        },
+        ExpiresIn=900  # 15 minutes
+    )
+    
+    # Store video metadata in DB
+    db.insert_video({
+        'id': video_id,
+        'user_id': user_id,
+        'status': 'UPLOADING',
+        'created_at': now()
+    })
+    
+    return presigned_url
+```
+
+#### 2. Transcoding Service
+
+After upload completes, a worker service:
+1. Reads raw video from S3.
+2. Transcodes to multiple resolutions:
+   - 240p (low quality, ~200 kbps)
+   - 480p (medium quality, ~800 kbps)
+   - 720p (high quality, ~2.5 mbps)
+   - 1080p (HD, ~5 mbps)
+3. Segments video into small chunks (~10 seconds each) for **HLS** (HTTP Live Streaming).
+4. Generates playlist file (`.m3u8`) listing all segments.
+5. Uploads segments and playlist to S3.
+
+**Why HLS/DASH?**
+- Client requests small chunks sequentially.
+- If network slows, client switches to lower quality mid-stream.
+- Resilient to network hiccups.
+
+#### 3. Playback Flow
+
+```
+User clicks play on video
+    ↓
+Backend returns HLS manifest URL (e.g., https://cdn.example.com/videos/123.m3u8)
+    ↓
+Client fetches manifest from CDN
+    ↓
+Manifest lists segments:
+  - segment_1.ts (240p)
+  - segment_2.ts (240p)
+  - segment_3.ts (480p) [switched quality]
+  ...
+    ↓
+Client fetches segments sequentially from CDN
+    ↓
+Video plays with adaptive bitrate based on network
+```
+
+#### 4. Database Schema (simplified)
+
+```sql
+-- Videos table
+CREATE TABLE videos (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(36),
+    title VARCHAR(255),
+    description TEXT,
+    duration INT,  -- in seconds
+    status ENUM('UPLOADING', 'PROCESSING', 'READY', 'FAILED'),
+    thumbnail_url VARCHAR(500),
+    s3_key VARCHAR(500),  -- path in S3
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    INDEX (user_id),
+    INDEX (status)
+);
+
+-- Video segments (for HLS)
+CREATE TABLE video_segments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    video_id VARCHAR(36),
+    resolution VARCHAR(10),  -- 240p, 480p, 720p, etc.
+    segment_number INT,
+    segment_duration FLOAT,
+    s3_url VARCHAR(500),
+    FOREIGN KEY (video_id) REFERENCES videos(id),
+    INDEX (video_id)
+);
+
+-- Watch history
+CREATE TABLE watch_history (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id VARCHAR(36),
+    video_id VARCHAR(36),
+    watched_until INT,  -- seconds watched
+    watched_at TIMESTAMP,
+    INDEX (user_id, watched_at),
+    FOREIGN KEY (video_id) REFERENCES videos(id)
+);
+
+-- Video views count (separate table for fast aggregation)
+CREATE TABLE video_stats (
+    video_id VARCHAR(36) PRIMARY KEY,
+    view_count BIGINT DEFAULT 0,
+    like_count BIGINT DEFAULT 0,
+    FOREIGN KEY (video_id) REFERENCES videos(id)
+);
+```
+
+#### 5. Scaling considerations
+
+**For sudden viral videos:**
+- **CDN caching:** CDN caches popular segments near users globally.
+- **Database reads:** Use read replicas for metadata queries.
+- **Object storage:** S3 already scales automatically.
+
+**Transcoding bottleneck:**
+- Use auto-scaling worker pool: if queue grows, spin up more workers.
+- Prioritize popular videos for faster transcoding.
+
+**Storage optimization:**
+- Delete raw upload after successful transcoding.
+- Archive old/unpopular videos to cheaper storage (S3 Glacier).
+
+---
+
+## 4. Implement a JIRA-like Service
+
+### Core Entities
+
+```python
+from datetime import datetime
+from enum import Enum
+
+class IssueStatus(Enum):
+    TO_DO = "TO_DO"
+    IN_PROGRESS = "IN_PROGRESS"
+    DONE = "DONE"
+
+class IssueType(Enum):
+    BUG = "BUG"
+    TASK = "TASK"
+    STORY = "STORY"
+
+class Priority(Enum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+    CRITICAL = 4
+
+class User:
+    def __init__(self, id, name, email):
+        self.id = id
+        self.name = name
+        self.email = email
+
+class Project:
+    def __init__(self, id, name, description):
+        self.id = id
+        self.name = name
+        self.description = description
+
+class Issue:
+    def __init__(self, id, title, description, project_id, issue_type, priority, assignee_id=None):
+        self.id = id
+        self.title = title
+        self.description = description
+        self.project_id = project_id
+        self.status = IssueStatus.TO_DO
+        self.issue_type = issue_type
+        self.priority = priority
+        self.assignee_id = assignee_id
+        self.created_at = datetime.now()
+        self.updated_at = datetime.now()
+        self.comments = []
+```
+
+### Database Schema
+
+```sql
+CREATE TABLE users (
+    id VARCHAR(36) PRIMARY KEY,
+    name VARCHAR(255),
+    email VARCHAR(255) UNIQUE,
+    created_at TIMESTAMP
+);
+
+CREATE TABLE projects (
+    id VARCHAR(36) PRIMARY KEY,
+    name VARCHAR(255),
+    description TEXT,
+    created_by VARCHAR(36),
+    created_at TIMESTAMP,
+    FOREIGN KEY (created_by) REFERENCES users(id)
+);
+
+CREATE TABLE issues (
+    id VARCHAR(36) PRIMARY KEY,
+    project_id VARCHAR(36),
+    title VARCHAR(500),
+    description TEXT,
+    status ENUM('TO_DO', 'IN_PROGRESS', 'DONE') DEFAULT 'TO_DO',
+    issue_type ENUM('BUG', 'TASK', 'STORY'),
+    priority INT DEFAULT 2,
+    assignee_id VARCHAR(36),
+    created_by VARCHAR(36),
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    version INT DEFAULT 1,  -- for optimistic locking
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    FOREIGN KEY (assignee_id) REFERENCES users(id),
+    FOREIGN KEY (created_by) REFERENCES users(id),
+    INDEX (project_id, status),
+    INDEX (assignee_id)
+);
+
+CREATE TABLE issue_comments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    issue_id VARCHAR(36),
+    author_id VARCHAR(36),
+    content TEXT,
+    created_at TIMESTAMP,
+    FOREIGN KEY (issue_id) REFERENCES issues(id),
+    FOREIGN KEY (author_id) REFERENCES users(id)
+);
+
+CREATE TABLE issue_audit (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    issue_id VARCHAR(36),
+    changed_by VARCHAR(36),
+    field_name VARCHAR(100),
+    old_value VARCHAR(500),
+    new_value VARCHAR(500),
+    changed_at TIMESTAMP,
+    FOREIGN KEY (issue_id) REFERENCES issues(id),
+    FOREIGN KEY (changed_by) REFERENCES users(id),
+    INDEX (issue_id, changed_at)
+);
+```
+
+### REST API Endpoints
+
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List
+
+app = FastAPI()
+
+# ===== CREATE PROJECT =====
+class CreateProjectRequest(BaseModel):
+    name: str
+    description: str
+
+@app.post("/projects")
+async def create_project(request: CreateProjectRequest, user_id: str):
+    project_id = str(uuid.uuid4())
+    db.insert_project({
+        'id': project_id,
+        'name': request.name,
+        'description': request.description,
+        'created_by': user_id
+    })
+    return {'id': project_id, 'name': request.name}
+
+# ===== CREATE ISSUE =====
+class CreateIssueRequest(BaseModel):
+    title: str
+    description: str
+    issue_type: str  # BUG, TASK, STORY
+    priority: int
+    assignee_id: Optional[str] = None
+
+@app.post("/projects/{project_id}/issues")
+async def create_issue(project_id: str, request: CreateIssueRequest, user_id: str):
+    issue_id = str(uuid.uuid4())
+    db.insert_issue({
+        'id': issue_id,
+        'project_id': project_id,
+        'title': request.title,
+        'description': request.description,
+        'status': 'TO_DO',
+        'issue_type': request.issue_type,
+        'priority': request.priority,
+        'assignee_id': request.assignee_id,
+        'created_by': user_id,
+        'version': 1
+    })
+    return {'id': issue_id}
+
+# ===== GET ISSUE =====
+@app.get("/issues/{issue_id}")
+async def get_issue(issue_id: str):
+    issue = db.find_issue_by_id(issue_id)
+    if not issue:
+        raise HTTPException(status_code=404, detail="Issue not found")
+    return issue
+
+# ===== UPDATE ISSUE (optimistic locking) =====
+class UpdateIssueRequest(BaseModel):
+    status: Optional[str] = None
+    assignee_id: Optional[str] = None
+    version: int  # current version for locking
+
+@app.patch("/issues/{issue_id}")
+async def update_issue(issue_id: str, request: UpdateIssueRequest, user_id: str):
+    issue = db.find_issue_by_id(issue_id)
+    
+    # Optimistic locking: check version
+    if issue['version'] != request.version:
+        raise HTTPException(status_code=409, detail="Issue was modified by another user")
+    
+    # Track audit
+    if request.status and request.status != issue['status']:
+        db.insert_audit({
+            'issue_id': issue_id,
+            'changed_by': user_id,
+            'field_name': 'status',
+            'old_value': issue['status'],
+            'new_value': request.status
+        })
+    
+    # Update issue
+    db.update_issue(issue_id, {
+        'status': request.status or issue['status'],
+        'assignee_id': request.assignee_id or issue['assignee_id'],
+        'version': issue['version'] + 1,
+        'updated_at': now()
+    })
+    
+    return {'id': issue_id, 'version': issue['version'] + 1}
+
+# ===== SEARCH/FILTER ISSUES =====
+@app.get("/projects/{project_id}/issues")
+async def list_issues(
+    project_id: str,
+    status: Optional[str] = None,
+    assignee_id: Optional[str] = None,
+    priority: Optional[int] = None,
+    skip: int = 0,
+    limit: int = 20
+):
+    query = {'project_id': project_id}
+    if status:
+        query['status'] = status
+    if assignee_id:
+        query['assignee_id'] = assignee_id
+    if priority:
+        query['priority'] = priority
+    
+    issues = db.find_issues(query, skip=skip, limit=limit)
+    return issues
+
+# ===== ADD COMMENT =====
+class AddCommentRequest(BaseModel):
+    content: str
+
+@app.post("/issues/{issue_id}/comments")
+async def add_comment(issue_id: str, request: AddCommentRequest, user_id: str):
+    db.insert_comment({
+        'issue_id': issue_id,
+        'author_id': user_id,
+        'content': request.content
+    })
+    return {'status': 'ok'}
+```
+
+### Test-Driven Development Example
+
+```python
+import pytest
+from fastapi.testclient import TestClient
+
+client = TestClient(app)
+
+def test_create_issue():
+    """Test creating a new issue"""
+    response = client.post(
+        "/projects/proj-123/issues",
+        json={
+            'title': 'Login button broken',
+            'description': 'Users cannot click login',
+            'issue_type': 'BUG',
+            'priority': 3
+        },
+        headers={'X-User-Id': 'user-1'}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert 'id' in data
+
+def test_update_issue_status():
+    """Test changing issue status"""
+    # First create an issue
+    create_response = client.post("/projects/proj-123/issues", ...)
+    issue_id = create_response.json()['id']
+    
+    # Get current version
+    get_response = client.get(f"/issues/{issue_id}")
+    version = get_response.json()['version']
+    
+    # Update status
+    update_response = client.patch(
+        f"/issues/{issue_id}",
+        json={
+            'status': 'IN_PROGRESS',
+            'version': version
+        },
+        headers={'X-User-Id': 'user-1'}
+    )
+    assert update_response.status_code == 200
+
+def test_concurrent_update_fails():
+    """Test that concurrent updates fail with optimistic locking"""
+    # User 1 fetches issue, version = 1
+    response1 = client.get(f"/issues/issue-123")
+    version1 = response1.json()['version']
+    
+    # User 2 fetches issue, version = 1
+    response2 = client.get(f"/issues/issue-123")
+    version2 = response2.json()['version']
+    
+    # User 2 updates first, increments version to 2
+    client.patch(
+        f"/issues/issue-123",
+        json={'status': 'DONE', 'version': version2},
+        headers={'X-User-Id': 'user-2'}
+    )
+    
+    # User 1 tries to update with stale version, should fail
+    update_response = client.patch(
+        f"/issues/issue-123",
+        json={'status': 'IN_PROGRESS', 'version': version1},
+        headers={'X-User-Id': 'user-1'}
+    )
+    assert update_response.status_code == 409  # Conflict
+
+def test_filter_issues_by_status():
+    """Test filtering issues by status"""
+    response = client.get("/projects/proj-123/issues?status=IN_PROGRESS")
+    assert response.status_code == 200
+    issues = response.json()
+    for issue in issues:
+        assert issue['status'] == 'IN_PROGRESS'
+```
+
+### Key Design Patterns
+
+**Optimistic Locking:**
+- Add a `version` column to issues.
+- When updating, check that version matches; if not, someone else modified it.
+- Increment version on each successful update.
+- Prevents lost updates in concurrent scenarios.
+
+**Audit Trail:**
+- Track every change in `issue_audit` table.
+- Useful for understanding who did what and when.
+- Can implement "undo" functionality.
+
+**Efficient Filtering:**
+- Index by `project_id`, `status`, `assignee_id`.
+- Composite index on (project_id, status) for common queries.
+- Pagination with `skip` and `limit`.
+
+---
+
+## 5. AWS S3 Multipart Upload
+
+### What is it?
+
+Instead of uploading one huge file in a single request, split it into smaller parts and upload each independently. S3 then combines them.
+
+### Why use it
+
+- **Better throughput:** Upload multiple parts in parallel → faster upload.
+- **Resilience:** If one part fails, retry just that part, not the entire file.
+- **Mandatory for large files:** Recommended for files > 5GB.
+- **Control:** Can adjust part size based on network conditions.
+
+### How it works (3-step process)
+
+**Step 1: Initiate Multipart Upload**
+```
+Request: POST /bucket/key?uploads
+Response: uploadId (unique identifier)
+```
+
+**Step 2: Upload Parts**
+```
+For each part:
+  Request: PUT /bucket/key?partNumber=1&uploadId=...
+  Body: part data (5MB - 5GB per part)
+  Response: ETag (checksum)
+  
+Keep track of partNumber -> ETag mapping
+```
+
+**Step 3: Complete Multipart Upload**
+```
+Request: POST /bucket/key?uploadId=...
+Body: XML list of (partNumber, ETag) pairs
+Response: Final object created in S3
+```
+
+### Python Implementation Example
+
+```python
+import boto3
+import concurrent.futures
+from pathlib import Path
+
+s3_client = boto3.client('s3')
+
+def multipart_upload_file(bucket, key, file_path, part_size=5 * 1024 * 1024):
+    """
+    Upload large file using multipart upload.
+    
+    Args:
+        bucket: S3 bucket name
+        key: S3 object key (path)
+        file_path: local file path
+        part_size: size of each part (default 5MB)
+    """
+    
+    file_size = Path(file_path).stat().st_size
+    num_parts = (file_size + part_size - 1) // part_size
+    
+    # Step 1: Initiate multipart upload
+    print(f"Initiating multipart upload for {file_path} ({num_parts} parts)")
+    response = s3_client.create_multipart_upload(Bucket=bucket, Key=key)
+    upload_id = response['UploadId']
+    
+    try:
+        # Step 2: Upload parts (in parallel for speed)
+        parts = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            
+            with open(file_path, 'rb') as f:
+                for part_num in range(1, num_parts + 1):
+                    start = (part_num - 1) * part_size
+                    end = min(start + part_size, file_size)
+                    
+                    f.seek(start)
+                    part_data = f.read(end - start)
+                    
+                    # Submit upload task to thread pool
+                    future = executor.submit(
+                        upload_part,
+                        bucket, key, upload_id, part_num, part_data
+                    )
+                    futures.append((part_num, future))
+            
+            # Collect results
+            for part_num, future in futures:
+                etag = future.result()
+                parts.append({'PartNumber': part_num, 'ETag': etag})
+        
+        # Sort by part number
+        parts.sort(key=lambda x: x['PartNumber'])
+        
+        # Step 3: Complete multipart upload
+        print(f"Completing multipart upload with {len(parts)} parts")
+        response = s3_client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={'Parts': parts}
+        )
+        
+        print(f"Upload successful! Object: {response['Location']}")
+        return response
+        
+    except Exception as e:
+        print(f"Upload failed: {e}. Aborting multipart upload.")
+        s3_client.abort_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id
+        )
+        raise
+
+def upload_part(bucket, key, upload_id, part_num, part_data):
+    """Upload a single part and return ETag"""
+    print(f"Uploading part {part_num} ({len(part_data)} bytes)")
+    response = s3_client.upload_part(
+        Bucket=bucket,
+        Key=key,
+        PartNumber=part_num,
+        UploadId=upload_id,
+        Body=part_data
+    )
+    etag = response['ETag']
+    print(f"Part {part_num} uploaded. ETag: {etag}")
+    return etag
+
+# Usage
+if __name__ == '__main__':
+    multipart_upload_file(
+        bucket='my-bucket',
+        key='videos/large-video.mp4',
+        file_path='/local/path/video.mp4',
+        part_size=10 * 1024 * 1024  # 10MB parts
+    )
+```
+
+### Interview talking points
+
+- **Part size:** Typically 5MB - 100MB. Larger parts = fewer requests but more memory. Smaller parts = more parallelism.
+- **Retry strategy:** If part 5 fails, only retry part 5, not entire file.
+- **Cleanup:** If upload fails/aborts, use `AbortMultipartUpload` to clean up partial parts (avoid storage costs).
+- **Checksum:** ETag verifies part integrity. Useful for detecting corruption.
+- **Pre-signed URLs:** Can generate pre-signed URLs for each part upload, allowing client to upload directly.
+
+---
+
+# DISTRIBUTED SYSTEMS CONCEPTS
+
+## What is a Distributed System?
+
+A distributed system is **multiple independent computers working together** to solve a problem or provide a service, communicating over a network.
+
+**Examples:**
+- Microservices architecture
+- Database replication across data centers
+- Load-balanced web servers
+- Cloud services (AWS, GCP, Azure)
+
+### Why they're needed
+
+- **Scalability:** Handle more users by adding more machines.
+- **Reliability:** If one machine fails, others continue working.
+- **Performance:** Distribute load geographically; serve users from closest location.
+
+### Challenges
+
+- **Complexity:** Hard to reason about multiple machines failing independently.
+- **Consistency:** Multiple copies of data may be out of sync.
+- **Latency:** Network communication is slow compared to local memory.
+- **Partial failure:** One machine may fail while others work, leading to unclear state.
+
+---
+
+## CAP Theorem
+
+The **CAP Theorem** states: In a distributed system, you can achieve **at most 2 of 3 guarantees**:
+
+### The Three Properties
+
+**Consistency (C):**
+- Every read returns the **most recent write**.
+- All nodes see the same data at the same time.
+- Example: You transfer $100 from account A to B. After transfer, all nodes show the new balance.
+
+**Availability (A):**
+- Every request gets a response, even if nodes fail.
+- System remains operational 24/7.
+- Example: A social media API responds to every request, even if some servers are down.
+
+**Partition Tolerance (P):**
+- System continues working even if network partition occurs (nodes can't talk to each other).
+- Must tolerate it because network failures happen in real world.
+
+### The Trade-off
+
+When a network partition happens, you must choose:
+
+**Partition Tolerance is always needed** (can't eliminate network failures), so really it's C vs A:
+
+#### CP (Consistency + Partition Tolerance)
+- Choose consistency: block requests if you can't guarantee latest data.
+- During partition: return error to user instead of stale data.
+- **Use case:** Financial systems (banking, stock trading). Users prefer "service unavailable" over inconsistent balances.
+- **Example:** If DB cluster partitions, some nodes refuse writes to avoid conflicting updates.
+
+#### AP (Availability + Partition Tolerance)
+- Choose availability: always respond, even if data might be stale.
+- During partition: nodes work independently, sync up when partition heals.
+- **Use case:** Social media, e-commerce. Users prefer slightly stale data over no service.
+- **Example:** If cache cluster partitions, each partition serves reads with its own copy. When healed, data "eventually" converges.
+
+### Simple example
+
+Imagine 2 bank servers S1 and S2, synced account balance.
+
+**Normal operation:**
+- User writes $100 transfer on S1.
+- S1 immediately syncs to S2.
+- User reads from S2, sees updated balance. ✓ Consistency maintained.
+
+**During network partition (S1 ↔ S2 can't talk):**
+
+**CP choice (consistency):**
+- S1 blocks the transfer: "Can't guarantee sync to S2, so no writes."
+- User gets error. No service, but data is consistent. (Banks do this.)
+
+**AP choice (availability):**
+- S1 completes transfer immediately. S2 doesn't know yet.
+- If user reads from S2, sees old balance. (Eventually sync when partition heals.)
+- Service available, but temporarily inconsistent. (Social media does this.)
+
+---
+
+## Replication and Consistency Models
+
+### Why replicate?
+
+- **Fault tolerance:** If one replica fails, others serve requests.
+- **Performance:** Read from closest replica.
+- **Availability:** More replicas = higher uptime.
+
+### Replication strategies
+
+#### Master-Slave (Primary-Replica)
+
+- **Master:** Handles all writes.
+- **Slaves:** Replicate data from master, serve reads.
+
+```
+Write request → Master → apply write
+                    ↓ (replicate)
+                Slave 1
+                Slave 2
+                Slave 3
+
+Read request → can hit any slave
+```
+
+**Pros:** Simple, strong consistency (reads from master).
+**Cons:** Master is bottleneck; slave lag (reads might be stale).
+
+#### Multi-Master (Active-Active)
+
+- **Multiple masters:** Each can accept writes.
+- **All replicate to each other.**
+
+```
+Write on Master 1 → replicates to Master 2, Master 3
+Write on Master 2 → replicates to Master 1, Master 3
+
+Conflict handling: Last-write-wins, vector clocks, or custom logic
+```
+
+**Pros:** No single bottleneck, high availability.
+**Cons:** Complex conflict resolution (what if both masters receive conflicting writes?).
+
+### Consistency models
+
+#### Strong Consistency
+
+Every read reflects all previous writes.
+
+```python
+write(x = 5)  # Write to server A
+read(x)       # Read from server B, still returns 5 (always up-to-date)
+```
+
+**Cost:** High latency (must wait for all replicas to sync).
+
+#### Eventual Consistency
+
+Replicas may be temporarily out of sync, but eventually converge to same state.
+
+```python
+write(x = 5)  # Write to server A
+read(x)       # Read from server B, might return stale value
+# After a few seconds, all replicas sync and read(x) returns 5
+```
+
+**Cost:** Temporary inconsistency, but low latency and high availability.
+
+---
+
+## Sharding (Partitioning)
+
+Split data across multiple machines by a shard key so each machine holds a subset.
+
+### Why shard?
+
+- **Horizontal scaling:** Single DB can't handle billion rows; split across 10 DBs.
+- **Parallel processing:** Each shard handles queries independently → lower latency.
+- **Isolation:** Failure in one shard doesn't affect others.
+
+### Sharding strategies
+
+#### Range-based
+
+Shard by key ranges. Example: User IDs 0-1M on Shard 1, 1M-2M on Shard 2.
+
+```
+User ID 50 → Shard 1
+User ID 1.5M → Shard 2
+User ID 2.5M → Shard 3
+```
+
+**Pros:** Simple logic.
+**Cons:** Can become unbalanced (e.g., active users all in ID 0-1M range).
+
+#### Hash-based
+
+Apply hash function to key. Shard = hash(key) % num_shards.
+
+```python
+def shard_for_user(user_id):
+    return hash(user_id) % num_shards
+
+shard = shard_for_user(user_id=12345)  # returns 0, 1, 2, ... depending on num_shards
+```
+
+**Pros:** Balanced distribution.
+**Cons:** Adding/removing shards requires re-hashing (costly); use consistent hashing.
+
+#### Consistent Hashing
+
+Map keys to positions on a ring. Replicas arranged on same ring.
+
+```
+Imagine a circular clock with 12 hours.
+- Key "user_123" hashes to hour 3.
+- Server A is at hour 3, Server B at hour 7, Server C at hour 10.
+- "user_123" goes to nearest server clockwise: Server A.
+
+If Server A dies, keys move to next server (B), others unaffected.
+If add Server D at hour 5, only keys between 3-5 shift.
+```
+
+**Pros:** Minimal re-hashing on server change.
+**Cons:** More complex.
+
+---
+
+## Consensus and Leader Election
+
+### Problem
+
+In distributed systems, nodes must agree on a value (e.g., "who is the leader?").
+
+Network delays and failures make this hard.
+
+### Leader Election
+
+One node becomes the leader and coordinates decisions. If leader dies, elect new one.
+
+#### Algorithms
+
+**Bully Algorithm:**
+- Every node has priority (e.g., by ID).
+- When leader dies, highest-priority alive node becomes leader.
+- Simple but not efficient.
+
+**Raft:**
+- Divides time into "terms" (like election rounds).
+- Nodes vote for candidate; majority vote wins.
+- Leader stays in power until failure.
+- Ensures safety (same decision across all nodes) and liveness (eventually progress).
+
+```
+Term 1: Server A elected leader
+Term 2: Server A fails; Server B elected leader
+...
+```
+
+Used in: etcd, Consul, CockroachDB.
+
+### Quorum-Based Consensus
+
+Require majority to agree on decision.
+
+```python
+def write(key, value):
+    # Write to leader + 2 replicas
+    responses = [
+        leader.write(key, value),
+        replica1.write(key, value),
+        replica2.write(key, value)
+    ]
+    
+    # Require 2/3 success (quorum)
+    if sum(1 for r in responses if r == success) >= 2:
+        return success
+    else:
+        return failure
+```
+
+**Guarantees:** If quorum acknowledges write, can read from any node and see the write (as long as any quorum node is alive).
+
+---
+
+## Consistency Guarantees with Distributed Databases
+
+### Read Consistency Levels
+
+**Strong/Immediate Consistency:**
+- Read always reflects all previous writes.
+- Slow (must read from primary).
+
+**Causal Consistency:**
+- Read reflects writes that causally preceded it.
+- Faster than strong, slower than eventual.
+
+**Eventual Consistency:**
+- Read may be stale, but will eventually be consistent.
+- Fastest, most available.
+
+### Write Consistency Levels
+
+**Synchronous Replication:**
+- Write blocks until replicas acknowledge.
+- Strong consistency, slower writes.
+
+**Asynchronous Replication:**
+- Write returns immediately; replication happens in background.
+- Fast writes, eventual consistency.
+
+---
+
+# COMMON DISTRIBUTED SYSTEMS PROBLEMS & SOLUTIONS
+
+## 1. Split Brain / Network Partition
+
+**Problem:** Network link fails, cluster splits into two parts that can't communicate. Both parts think they're the real cluster; both may accept writes → conflicting data.
+
+**Solutions:**
+- **Quorum-based decision:** Require majority of nodes to agree. Minority partition stops serving requests.
+- **Fencing:** Use external arbiter (e.g., shared storage) to "fence off" minority partition.
+- **Unique leader ID:** Only node with highest ID in majority partition can be leader.
+
+**Example:** In 5-node cluster, if split 3-2, the 3-node partition continues; 2-node partition stops.
+
+---
+
+## 2. Cascading Failures
+
+**Problem:** One overloaded service fails. Upstream services retry, overloading more services. Entire system collapses like dominoes.
+
+**Solutions:**
+- **Circuit breaker:** Stop retrying if downstream service is failing; fail fast instead.
+- **Bulkheads:** Isolate failures. If service A fails, don't let it bring down service B (separate thread pools, timeouts).
+- **Load shedding:** Reject low-priority requests when overloaded to protect high-priority ones.
+- **Auto-scaling:** Add servers when load increases before cascade starts.
+
+---
+
+## 3. Distributed Consensus / Byzantine Generals Problem
+
+**Problem:** Multiple nodes must agree on a value, but some may be faulty/malicious. How to ensure consensus?
+
+**Solutions:**
+- **Paxos:** Complex but proven consensus algorithm for non-Byzantine faults.
+- **Raft:** Simpler consensus, preferred in practice.
+- **Byzantine Fault Tolerance (BFT):** For malicious nodes, but expensive; mainly used in blockchain.
+
+---
+
+## 4. Data Consistency in Replication
+
+**Problem:** Primary and replicas out of sync. Read from replica sees stale data. Write goes to primary, replicas lag.
+
+**Solutions:**
+- **Read from primary:** Slower, but always consistent.
+- **Read-after-write consistency:** After write, always read from primary for that key. Other reads from replica.
+- **Eventual consistency with quorum reads:** Read from majority of replicas; if any has the write, return it.
+- **Version vectors / Lamport clocks:** Track causal ordering to detect stale reads.
+
+---
+
+## 5. Distributed Transactions / ACID across multiple databases
+
+**Problem:** Transaction spans multiple databases. One commits, another fails. How to keep consistency?
+
+**Solutions:**
+- **Two-Phase Commit (2PC):** Phase 1: all nodes prepare. Phase 2: all commit or all rollback. Slow, blocks on failures.
+- **Saga Pattern:** Break transaction into steps. Each step is local transaction. If step N fails, compensating transactions undo steps N-1, N-2, etc. (Event-driven or orchestration-based.)
+- **Event Sourcing:** Instead of storing state, store all events. Rebuild state by replaying events. Naturally supports rollback and replay.
+
+---
+
+## 6. Availability vs Consistency (CAP tradeoff)
+
+**Problem:** During network partition, can't have both consistency and availability.
+
+**Solutions:**
+- **For financial systems:** Choose consistency. Block writes if can't reach all replicas.
+- **For social media:** Choose availability. Accept temporary inconsistency; eventually sync.
+- **Quorum reads/writes:** Balance the two. Write to majority, read from majority. Guarantees consistency even if some nodes fail.
+
+---
+
+## 7. Distributed Tracing and Debugging
+
+**Problem:** Request spans multiple services across data centers. Hard to debug latency or failures.
+
+**Solutions:**
+- **Correlation IDs:** Assign unique ID to each request; pass through all services. Logs include ID.
+- **Distributed tracing (Jaeger, Zipkin):** Automatically record request flow across services, latencies per service.
+- **Centralized logging (ELK stack):** Collect logs from all services; search by correlation ID.
+- **Metrics and alerting (Prometheus):** Track latency, error rate, CPU per service. Alert on anomalies.
+
+---
+
+## 8. Handling Idempotency in Distributed Systems
+
+**Problem:** Network fails mid-request. Client retries. Server processes same request twice → duplicate effects (charged twice, created 2 orders).
+
+**Solutions:**
+- **Idempotent keys / Request IDs:** Client sends unique ID per request. Server deduplicates by ID.
+- **Idempotent operations:** Design operations so repeated execution has same effect (PUT, DELETE are naturally idempotent; POST is not).
+- **Deduplication cache:** Store (request_id, response) in cache. On retry, return cached response.
+
+**Example:**
+```python
+@app.post("/orders")
+async def create_order(request: CreateOrderRequest, idempotency_key: str):
+    # Check if already processed
+    cached = cache.get(f"order:{idempotency_key}")
+    if cached:
+        return cached  # Return same response
+    
+    # Create order
+    order = db.insert_order(...)
+    response = {'id': order.id}
+    
+    # Cache for 24 hours
+    cache.set(f"order:{idempotency_key}", response, 86400)
+    return response
+```
+
+---
+
+## 9. Distributed Locking
+
+**Problem:** Multiple services accessing shared resource (e.g., file, database row). Need exclusive access.
+
+**Solutions:**
+- **Optimistic locking:** Use version numbers. If version changed, conflict detected.
+- **Pessimistic locking:** Lock resource before accessing. Other threads wait.
+- **Distributed lock with Redis:** Use `SET ... NX EX` for atomic lock + TTL.
+- **Lease-based locking:** Lock expires after TTL; prevents deadlocks.
+
+**Example (Redis):**
+```python
+import redis
+import time
+import uuid
+
+client = redis.StrictRedis()
+
+def acquire_lock(key, ttl=10):
+    lock_id = str(uuid.uuid4())
+    acquired = client.set(key, lock_id, nx=True, ex=ttl)
+    return lock_id if acquired else None
+
+def release_lock(key, lock_id):
+    lua_script = """
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+    else
+        return 0
+    end
+    """
+    client.eval(lua_script, 1, key, lock_id)
+
+# Usage
+lock_id = acquire_lock("resource:user_123")
+if lock_id:
+    try:
+        # Do work with exclusive access
+        db.update_user(user_123, ...)
+    finally:
+        release_lock("resource:user_123", lock_id)
+```
+
+---
+
+## 10. Message Queue for Async Processing
+
+**Problem:** Long-running task blocks HTTP request. User waits. Bad experience.
+
+**Solutions:**
+- **Message queue (RabbitMQ, Kafka):** Enqueue task, return immediately. Worker processes asynchronously.
+- **Dead letter queue:** If worker fails repeatedly, move to DLQ for manual review.
+- **Retries with backoff:** Exponential backoff (1s, 2s, 4s, 8s...) reduces thundering herd.
+- **Ordering guarantees:** For tasks that must run in order, use single queue per entity (e.g., per user).
+
+---
+
+# ESSENTIAL ALGORITHMS FOR BACKEND
+
+## 1. Sorting Algorithms
+
+### Quicksort
+
+**Idea:** Pick a pivot, partition array into smaller and larger elements, recursively sort.
+
+**Layman explanation:** You have a pile of papers with numbers. Pick one number (pivot). Put all smaller numbers on left, larger on right. Then apply same process to left and right piles.
+
+```python
+def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    
+    pivot = arr[len(arr) // 2]
+    smaller = [x for x in arr if x < pivot]
+    equal = [x for x in arr if x == pivot]
+    larger = [x for x in arr if x > pivot]
+    
+    return quicksort(smaller) + equal + quicksort(larger)
+
+# Time: O(n log n) average, O(n²) worst case
+# Space: O(log n) due to recursion
+```
+
+**When to use:** General-purpose sorting. Most reliable choice.
+
+### Mergesort
+
+**Idea:** Divide array in half, recursively sort each half, merge sorted halves.
+
+**Layman explanation:** Split pile into two. Sort each pile. Merge by comparing top cards from each pile.
+
+```python
+def mergesort(arr):
+    if len(arr) <= 1:
+        return arr
+    
+    mid = len(arr) // 2
+    left = mergesort(arr[:mid])
+    right = mergesort(arr[mid:])
+    
+    # Merge
+    result = []
+    i, j = 0, 0
+    while i < len(left) and j < len(right):
+        if left[i] <= right[j]:
+            result.append(left[i])
+            i += 1
+        else:
+            result.append(right[j])
+            j += 1
+    result.extend(left[i:])
+    result.extend(right[j:])
+    
+    return result
+
+# Time: O(n log n) always
+# Space: O(n) for temp arrays
+```
+
+**When to use:** When you need guaranteed O(n log n), or for external sorting (data on disk).
+
+### Heapsort
+
+**Idea:** Build a heap, repeatedly extract max element.
+
+**Layman explanation:** Arrange numbers in a tree where parents are bigger than children. Keep removing the biggest (root).
+
+```python
+def heapsort(arr):
+    # Build max heap (in-place)
+    for i in range(len(arr) // 2 - 1, -1, -1):
+        heapify(arr, i, len(arr))
+    
+    # Extract elements one by one
+    for i in range(len(arr) - 1, 0, -1):
+        arr[0], arr[i] = arr[i], arr[0]  # Move max to end
+        heapify(arr, 0, i)
+    
+    return arr
+
+def heapify(arr, i, n):
+    largest = i
+    left = 2 * i + 1
+    right = 2 * i + 2
+    
+    if left < n and arr[left] > arr[largest]:
+        largest = left
+    if right < n and arr[right] > arr[largest]:
+        largest = right
+    
+    if largest != i:
+        arr[i], arr[largest] = arr[largest], arr[i]
+        heapify(arr, largest, n)
+
+# Time: O(n log n) always
+# Space: O(1) in-place
+```
+
+**When to use:** When space is critical (in-place sorting) or need guaranteed O(n log n).
+
+---
+
+## 2. Searching Algorithms
+
+### Binary Search
+
+**Idea:** Array is sorted. Check middle element; if target is smaller, search left half; else search right.
+
+**Layman explanation:** Like guessing a number: "Is it higher or lower?" You narrow down range by half each time.
+
+```python
+def binary_search(arr, target):
+    left, right = 0, len(arr) - 1
+    
+    while left <= right:
+        mid = (left + right) // 2
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            left = mid + 1  # Search right
+        else:
+            right = mid - 1  # Search left
+    
+    return -1  # Not found
+
+# Time: O(log n)
+# Space: O(1)
+```
+
+**When to use:** Searching in sorted arrays/lists. Essential for backend (e.g., finding a user ID in sorted list of millions).
+
+### Depth-First Search (DFS)
+
+**Idea:** Explore as far as possible along each branch before backtracking.
+
+**Layman explanation:** Like exploring a maze: go deep, hit dead end, backtrack, try another path.
+
+```python
+def dfs(graph, node, visited=None):
+    """
+    graph: {node: [neighbors]}
+    """
+    if visited is None:
+        visited = set()
+    
+    visited.add(node)
+    print(node)
+    
+    for neighbor in graph[node]:
+        if neighbor not in visited:
+            dfs(graph, neighbor, visited)
+    
+    return visited
+
+# Time: O(V + E) where V = nodes, E = edges
+# Space: O(V) for visited set + O(V) for recursion stack
+```
+
+**When to use:** Finding connected components, topological sort, detecting cycles in graphs.
+
+### Breadth-First Search (BFS)
+
+**Idea:** Explore all neighbors at current depth before going deeper.
+
+**Layman explanation:** Like expanding circles: explore everyone at distance 1, then distance 2, etc.
+
+```python
+from collections import deque
+
+def bfs(graph, start):
+    """
+    graph: {node: [neighbors]}
+    """
+    visited = {start}
+    queue = deque([start])
+    
+    while queue:
+        node = queue.popleft()
+        print(node)
+        
+        for neighbor in graph[node]:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append(neighbor)
+    
+    return visited
+
+# Time: O(V + E)
+# Space: O(V) for visited + queue
+```
+
+**When to use:** Shortest path in unweighted graph, level-order traversal, connected components.
+
+---
+
+## 3. Hash-based Algorithms
+
+### Hash Function and Hash Table
+
+**Idea:** Use hash function to map key → index in array. Store value at that index.
+
+**Layman explanation:** Like a phonebook. Name "Alice" hashes to page 5. We store her number on page 5.
+
+```python
+class HashTable:
+    def __init__(self, size=100):
+        self.size = size
+        self.table = [[] for _ in range(size)]  # List of lists for chaining
+    
+    def hash(self, key):
+        """Hash function: convert key to index"""
+        return hash(key) % self.size
+    
+    def insert(self, key, value):
+        index = self.hash(key)
+        # Handle collisions with chaining
+        for i, (k, v) in enumerate(self.table[index]):
+            if k == key:
+                self.table[index][i] = (key, value)
+                return
+        self.table[index].append((key, value))
+    
+    def get(self, key):
+        index = self.hash(key)
+        for k, v in self.table[index]:
+            if k == key:
+                return v
+        return None
+
+# Time: O(1) average, O(n) worst case
+# Space: O(n)
+```
+
+**When to use:** Fast lookups, deduplication, caching, counting frequencies.
+
+### Consistent Hashing
+
+**Idea:** For distributed systems. Map keys to positions on a ring. Replicas arranged on ring too. Key goes to nearest replica.
+
+**Layman explanation:** Imagine servers arranged in a circle. Key hashes to a position on circle; goes to nearest server clockwise.
+
+**Benefits:** If server dies or joins, only keys between adjacent servers rehash (minimal disruption).
+
+---
+
+## 4. Graph Algorithms
+
+### Dijkstra's Algorithm (Shortest Path)
+
+**Idea:** Find shortest path from source to all other nodes in weighted graph.
+
+**Layman explanation:** Like GPS finding shortest route. At each step, pick unvisited node with smallest distance from source.
+
+```python
+import heapq
+
+def dijkstra(graph, start):
+    """
+    graph: {node: [(neighbor, weight)]}
+    """
+    distances = {node: float('inf') for node in graph}
+    distances[start] = 0
+    pq = [(0, start)]  # (distance, node)
+    visited = set()
+    
+    while pq:
+        current_dist, node = heapq.heappop(pq)
+        
+        if node in visited:
+            continue
+        
+        visited.add(node)
+        
+        for neighbor, weight in graph[node]:
+            new_dist = current_dist + weight
+            if new_dist < distances[neighbor]:
+                distances[neighbor] = new_dist
+                heapq.heappush(pq, (new_dist, neighbor))
+    
+    return distances
+
+# Time: O((V + E) log V)
+# Space: O(V)
+```
+
+**When to use:** Finding shortest path in networks, routing algorithms, game AI.
+
+### Topological Sort
+
+**Idea:** Order nodes such that for every edge u→v, u comes before v. Used for dependency ordering.
+
+**Layman explanation:** You have tasks with dependencies (Task A before Task B). Topological sort gives valid execution order.
+
+```python
+def topological_sort(graph):
+    """
+    graph: {node: [outgoing_neighbors]}
+    DAG (Directed Acyclic Graph)
+    """
+    visited = set()
+    stack = []
+    
+    def dfs(node):
+        visited.add(node)
+        for neighbor in graph.get(node, []):
+            if neighbor not in visited:
+                dfs(neighbor)
+        stack.append(node)
+    
+    for node in graph:
+        if node not in visited:
+            dfs(node)
+    
+    return stack[::-1]  # Reverse to get correct order
+
+# Time: O(V + E)
+# Space: O(V)
+```
+
+**When to use:** Task scheduling, build systems (compile in dependency order), course prerequisites.
+
+---
+
+## 5. Dynamic Programming
+
+**Idea:** Break problem into overlapping subproblems. Solve each once, store result. Avoid recomputing.
+
+**Layman explanation:** Like a workout log. Instead of recalculating how many push-ups you did week 1, you look it up.
+
+### Example: Fibonacci (memoization)
+
+```python
+def fib(n, memo={}):
+    """Calculate nth Fibonacci number"""
+    if n in memo:
+        return memo[n]
+    if n <= 1:
+        return n
+    
+    memo[n] = fib(n-1, memo) + fib(n-2, memo)
+    return memo[n]
+
+# Time: O(n) with memoization vs O(2^n) without
+# Space: O(n)
+```
+
+### Example: Longest Increasing Subsequence
+
+```python
+def longest_increasing_subsequence(arr):
+    """Find length of longest increasing subsequence"""
+    n = len(arr)
+    if n == 0:
+        return 0
+    
+    dp = [1] * n  # dp[i] = LIS length ending at arr[i]
+    
+    for i in range(1, n):
+        for j in range(i):
+            if arr[j] < arr[i]:
+                dp[i] = max(dp[i], dp[j] + 1)
+    
+    return max(dp)
+
+# Time: O(n²)
+# Space: O(n)
+```
+
+**When to use:** Optimization problems (longest sequence, minimum cost), probability problems.
+
+---
+
+## 6. Greedy Algorithms
+
+**Idea:** At each step, make locally optimal choice, hoping for global optimum.
+
+**Layman explanation:** Like choosing loose change: take biggest coin first to minimize total coins.
+
+### Example: Activity Selection
+
+```python
+def select_activities(activities):
+    """
+    activities: list of (start, end) tuples
+    Return max number of non-overlapping activities
+    """
+    # Sort by end time
+    activities.sort(key=lambda x: x[1])
+    
+    selected = [activities[0]]
+    for i in range(1, len(activities)):
+        if activities[i][0] >= selected[-1][1]:  # No overlap
+            selected.append(activities[i])
+    
+    return selected
+
+# Time: O(n log n) due to sorting
+# Space: O(n)
+```
+
+**When to use:** Scheduling, fractional knapsack, Huffman coding.
+
+---
+
+## 7. String Algorithms
+
+### KMP (Knuth-Morris-Pratt)
+
+**Idea:** Find pattern in text efficiently without backtracking.
+
+**Layman explanation:** Like searching for a word in a document but smarter about where to resume search after mismatch.
+
+```python
+def kmp_search(text, pattern):
+    """Find all occurrences of pattern in text"""
+    if not pattern or not text:
+        return []
+    
+    # Build failure function
+    m = len(pattern)
+    lps = [0] * m  # Longest proper prefix which is also suffix
+    j = 0
+    for i in range(1, m):
+        while j > 0 and pattern[i] != pattern[j]:
+            j = lps[j - 1]
+        if pattern[i] == pattern[j]:
+            j += 1
+        lps[i] = j
+    
+    # Search
+    results = []
+    j = 0
+    for i in range(len(text)):
+        while j > 0 and text[i] != pattern[j]:
+            j = lps[j - 1]
+        if text[i] == pattern[j]:
+            j += 1
+        if j == m:
+            results.append(i - m + 1)
+            j = lps[j - 1]
+    
+    return results
+
+# Time: O(n + m)
+# Space: O(m)
+```
+
+**When to use:** Text search, plagiarism detection, DNA sequencing.
+
+---
+
+## 8. Caching Algorithms
+
+### LRU (Least Recently Used) Cache
+
+**Idea:** Cache of fixed size. When full, evict least recently used entry.
+
+**Layman explanation:** Your browser's cache: keeps last 100 websites. When new site loaded, removes oldest unused site.
+
+```python
+from collections import OrderedDict
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+    
+    def get(self, key):
+        if key not in self.cache:
+            return -1
+        
+        # Move to end (most recently used)
+        self.cache.move_to_end(key)
+        return self.cache[key]
+    
+    def put(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        
+        self.cache[key] = value
+        
+        # Evict least recently used if over capacity
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
+
+# Time: O(1) per operation
+# Space: O(capacity)
+```
+
+**When to use:** Database caching, web server caching, CDN caching.
+
+---
+
+## 9. Concurrency Patterns
+
+### Mutex/Lock
+
+**Idea:** Only one thread can access critical section at a time.
+
+```python
+import threading
+
+lock = threading.Lock()
+counter = 0
+
+def increment():
+    global counter
+    with lock:  # Acquire lock
+        temp = counter
+        temp += 1
+        counter = temp
+        # Release lock automatically
+
+# Without lock: multiple threads can read counter=5, all increment to 6
+# With lock: only one reads, increments to 6; others wait
+```
+
+**When to use:** Protecting shared mutable state.
+
+### Semaphore
+
+**Idea:** Counter allowing N threads in critical section.
+
+```python
+semaphore = threading.Semaphore(3)  # Allow 3 threads
+
+def access_resource():
+    with semaphore:
+        # Max 3 threads here simultaneously
+        print("Accessing resource")
+```
+
+**When to use:** Rate limiting, connection pools (e.g., limit DB connections to 10).
+
+---
+
+# INTERVIEW PRACTICE QUESTIONS
+
+## Token Bucket & Rate Limiting
+
+1. **Implement a token bucket rate limiter in Python for a single machine.**
+   - Describe structure: tokens, capacity, refill_rate, last_refill_time.
+   - Show how to check if request allowed.
+   - Complexity: O(1) per request.
+
+2. **How would you make your rate limiter work across 10 servers behind a load balancer?**
+   - Need shared state in Redis.
+   - Use Lua script for atomic updates (compare-and-swap).
+   - Ensure no race conditions.
+
+3. **Design a multi-tier rate limiting system:**
+   - **Tier 1:** Per IP address.
+   - **Tier 2:** Per API key / user.
+   - **Tier 3:** Global system rate limit.
+   - One user maxed out shouldn't affect others.
+
+4. **What happens if a user sends a burst of requests when the bucket is at capacity?**
+   - Discuss token bucket's ability to handle bursts vs fixed window.
+   - Example: Bucket capacity 100, refill rate 10/sec. Idle for 10 sec → 100 tokens. Can send 100 requests instantly.
+
+5. **How would you handle a user with unlimited tokens? Prevent abuse?**
+   - Implement hard limits (per second throughput cap).
+   - Use circuit breaker if user consistently abuses.
+   - Return HTTP 429 with Retry-After header.
+
+6. **Compare token bucket, leaky bucket, sliding window, and fixed window approaches.**
+   - Token bucket: Burst-friendly, average rate enforced.
+   - Leaky bucket: Smooth rate, no bursts.
+   - Sliding window: Smooth, accurate, but complex.
+   - Fixed window: Simple, but window boundary issues.
+
+---
+
+## System Design: Video Streaming
+
+1. **Walk through end-to-end flow when user uploads a video to when another user can play it.**
+   - User uploads to pre-signed S3 URL.
+   - Backend enqueues transcode job.
+   - Worker transcodes to multiple formats/resolutions.
+   - Generates HLS segments and playlist.
+   - Uploads to S3.
+   - Updates DB status to READY.
+   - Viewer requests video, gets HLS manifest, streams segments from CDN.
+
+2. **How would you handle a viral video with sudden spike in viewers?**
+   - CDN caches segments near users.
+   - Database uses read replicas.
+   - S3 automatically scales.
+   - API gateway load balances across backend servers.
+
+3. **Design the database schema for videos, users, and watch history. Discuss indexes.**
+   - videos: id, user_id, title, status, s3_key.
+   - Indexes on user_id, status.
+   - watch_history: user_id, video_id, watched_until.
+   - Composite index on (user_id, watched_at) for fast "recent videos" queries.
+
+4. **How would you implement "adaptive bitrate streaming"?**
+   - Transcode video into multiple bitrates (240p @ 200kbps, 480p @ 800kbps, etc.).
+   - Each bitrate has separate segment files.
+   - HLS playlist lists all variants.
+   - Player monitors download speed; switches variant mid-stream.
+
+5. **How to prevent video piracy / unauthorized downloads?**
+   - Use signed URLs (pre-signed, time-limited).
+   - Only return segments to authenticated users.
+   - Use encryption (encrypt segments, key from server).
+   - DRM (Digital Rights Management) for high-value content.
+
+6. **How would you design a "recommendation" system recommending videos to users?**
+   - Collect watch history.
+   - Use collaborative filtering (if users watched A and B, recommend similar videos).
+   - Use content-based filtering (if user likes "comedy", recommend other comedy).
+   - ML model: train on watch history, predict next video.
+
+7. **How to handle simultaneous uploads from millions of users?**
+   - Direct-to-S3 upload (bypasses backend).
+   - S3 automatically scales.
+   - Use multipart upload for large files.
+   - Distribute uploads across multiple S3 regions.
+
+---
+
+## JIRA-like Service & TDD
+
+1. **Design the DB schema for a JIRA-like system.**
+   - users, projects, issues, comments, audit.
+   - Key: issue.status, issue.assignee, timestamps.
+   - Composite indexes on (project_id, status).
+
+2. **How would you implement optimistic locking to prevent lost updates?**
+   - Add version column to issues.
+   - Before update, check version matches.
+   - If mismatch, return 409 Conflict.
+   - Increment version on successful update.
+
+3. **Describe the TDD approach: write tests first, then code.**
+   - Write test: test_create_issue().
+   - Test should fail initially (no implementation).
+   - Write minimal code to pass test.
+   - Refactor code for clarity.
+   - Repeat for each feature.
+
+4. **How to design API for filtering issues (status, assignee, priority)?**
+   - GET /projects/{id}/issues?status=IN_PROGRESS&assignee=user123.
+   - Build query incrementally based on filters.
+   - Use indexes to optimize.
+   - Support pagination (skip, limit).
+
+5. **Implement an audit trail tracking who changed what and when.**
+   - On every update, insert row in issue_audit.
+   - Record field_name, old_value, new_value, changed_by, changed_at.
+   - Use for compliance, debugging, "undo" feature.
+
+6. **How to implement full-text search for issue descriptions?**
+   - Add FULLTEXT index on issue.description.
+   - Use MySQL MATCH AGAINST(...) or Elasticsearch.
+   - Support phrase search, Boolean operators.
+
+7. **How would you handle "issue dependencies" (Issue A blocks Issue B)?**
+   - Add issue_dependencies table: (blocking_issue_id, blocked_issue_id).
+   - When blocking issue moves to DONE, notify blocked issue assignee.
+   - Prevent closing blocked issue if blocker not done.
+
+---
+
+## AWS S3 & Large File Uploads
+
+1. **Explain multipart upload and why it's useful.**
+   - Split large file into parts (e.g., 5MB each).
+   - Upload parts in parallel.
+   - S3 assembles into single object.
+   - Faster upload, resilient to failures.
+
+2. **Implement a Python script to multipart upload a 1GB file.**
+   - Initiate upload (CreateMultipartUpload).
+   - Split file into parts.
+   - Upload parts in parallel (ThreadPoolExecutor).
+   - Collect ETags.
+   - Complete upload (CompleteMultipartUpload).
+
+3. **How would you implement "pause and resume" for uploads?**
+   - Store uploadId in client.
+   - Track which parts uploaded (in memory or DB).
+   - On resume, upload remaining parts.
+   - Specify part-specific range headers if resuming after network failure.
+
+4. **What happens if one part fails during upload?**
+   - Retry that specific part (not entire file).
+   - Exponential backoff.
+   - After max retries, abort upload (AbortMultipartUpload).
+
+5. **How to securely allow direct client uploads to S3?**
+   - Backend generates pre-signed URL (time-limited, limited scope).
+   - Client uploads directly to pre-signed URL.
+   - Backend never sees file content.
+   - Pre-signed URL expires after 15 minutes.
+
+6. **Design a flow to upload video directly to S3 and transcode.**
+   - User gets pre-signed upload URL from backend.
+   - User uploads directly to S3.
+   - S3 triggers event (SNS/SQS).
+   - Lambda or worker picks up event, transcodes.
+   - Stores result back to S3.
+   - Backend polls or uses webhook when ready.
+
+---
+
+## Distributed Systems: Consensus & Replication
+
+1. **Explain CAP theorem. Give examples for each combination (CP, AP).**
+   - **CP (Consistency + Partition Tolerance):** Bank account. Block transactions if can't sync replicas.
+   - **AP (Availability + Partition Tolerance):** Social media. Always respond, eventual consistency.
+   - **Trade-off:** Can't have all three. Network partitions happen; choose C or A.
+
+2. **How would you design a distributed key-value store?**
+   - **Partitioning:** Consistent hashing. Key hashes to node.
+   - **Replication:** Store key on node + 2 replicas for fault tolerance.
+   - **Consistency:** Quorum read/write. Write to leader + replicas; require majority ACK.
+   - **Leader election:** Use Raft or Paxos.
+
+3. **Explain master-slave replication. What's a downside?**
+   - Master accepts writes; slaves replicate; slaves serve reads.
+   - Downside: Slave lag. Read from slave might return stale data.
+   - Mitigation: Read from master after write, or wait for replica to catch up.
+
+4. **How to handle leader failure in master-slave setup?**
+   - Detect failure (heartbeat timeout).
+   - Promote highest-priority slave to master.
+   - Notify clients of new master.
+   - Synced slaves catch up; unsynced slaves discarded.
+   - Use Raft or external arbiter (e.g., Zookeeper) to prevent split-brain.
+
+5. **Explain Raft consensus algorithm at high level.**
+   - Time divided into terms (like election rounds).
+   - Nodes vote for leader candidate.
+   - Leader elected if gets majority vote.
+   - Leader sends heartbeats to keep authority.
+   - On leader failure, new election starts.
+
+6. **What's "split-brain"? How to prevent?**
+   - **Problem:** Network partition. Both halves think they're real cluster. Both accept writes.
+   - **Solution:** Require quorum (majority). Minority partition stops serving requests.
+   - Example: 5-node cluster splits 3-2. Only 3-node partition continues.
+
+7. **Design a distributed counter (like view count).**
+   - **Naïve:** Single DB row. Bottleneck.
+   - **Solution:** Use local counters on each server. Periodically flush to DB.
+   - **Accuracy tradeoff:** Eventually consistent (exact count after flush).
+   - **Scale:** Billions of increments/second across world.
+
+8. **How to ensure "read-after-write" consistency in distributed system?**
+   - After write, always read from master (or wait for replica).
+   - Or: store write timestamp; read from replica only if replica's lamport clock >= timestamp.
+   - Trade-off: Slower reads, but always see your writes.
+
+---
+
+## Distributed Systems: Problems & Solutions
+
+1. **How to prevent cascading failures in microservices?**
+   - **Circuit breaker:** Stop calling failing service; fail fast.
+   - **Bulkheads:** Isolate failures (separate thread pools per service).
+   - **Load shedding:** Reject low-priority requests during overload.
+   - **Retry with backoff:** Exponential backoff (1s, 2s, 4s, 8s...).
+   - **Monitoring/alerting:** Detect anomalies early.
+
+2. **How to handle distributed transactions (spanning multiple DBs)?**
+   - **2PC (Two-Phase Commit):** Phase 1: prepare. Phase 2: commit/rollback. Blocks on failures.
+   - **Saga Pattern:** Break into steps. If step fails, compensating transactions undo prior steps.
+   - **Event sourcing:** Log all events. Rebuild state by replaying. Naturally supports rollback.
+
+3. **How to handle network latency in distributed system?**
+   - **Async:** Don't wait for response; use callbacks/futures.
+   - **Caching:** Cache frequently accessed data locally.
+   - **Batching:** Group multiple requests into one.
+   - **Compression:** Reduce payload size.
+   - **CDN:** Serve from location near user.
+
+4. **How to implement "exactly-once" semantics (no duplicates)?**
+   - **Idempotent keys:** Client sends unique ID per request.
+   - **Deduplication cache:** Store (request_id, response). On retry, return cached response.
+   - **Idempotent operations:** Design operations so repeated execution = same effect (PUT, DELETE).
+
+5. **How would you implement distributed tracing for debugging?**
+   - Assign correlation ID to each request.
+   - Pass ID through all services.
+   - Log with correlation ID.
+   - Use distributed tracing tool (Jaeger, Zipkin) to visualize request flow.
+
+---
+
+## Algorithms: Questions
+
+1. **Implement binary search. What's time complexity?**
+   - O(log n). Eliminate half of remaining elements each iteration.
+   - Code: two pointers (left, right), check mid element.
+
+2. **Implement quicksort and explain how it works.**
+   - Pick pivot, partition into smaller/equal/larger.
+   - Recursively sort left and right.
+   - O(n log n) average, O(n²) worst case.
+
+3. **Difference between DFS and BFS. When to use each?**
+   - **DFS:** Deep, use stack or recursion. Finds any path, good for backtracking.
+   - **BFS:** Level-by-level, use queue. Finds shortest path in unweighted graph.
+
+4. **Implement LRU cache. How does it work?**
+   - Use ordered dict or doubly linked list + hash map.
+   - On get/put, move to end (most recently used).
+   - On insert when full, remove from front (least recently used).
+   - O(1) per operation.
+
+5. **Explain dynamic programming. Give an example.**
+   - Break problem into overlapping subproblems.
+   - Solve each once, store result.
+   - Example: Fibonacci with memoization. O(n) instead of O(2^n).
+
+6. **How does consistent hashing work? Why use for distributed systems?**
+   - Map keys and servers to positions on a ring.
+   - Key goes to nearest server (clockwise).
+   - If server dies, only keys between adjacent servers rehash.
+   - Minimal disruption compared to hash(key) % num_servers.
+
+7. **Implement Dijkstra's algorithm for shortest path.**
+   - Use priority queue (min heap).
+   - Start from source, greedily pick closest unvisited node.
+   - O((V + E) log V).
+
+8. **What's the Longest Increasing Subsequence (LIS)? How to solve?**
+   - Find longest subsequence where elements are in increasing order.
+   - DP[i] = LIS length ending at arr[i].
+   - dp[i] = max(dp[j] + 1 for all j < i where arr[j] < arr[i]).
+   - O(n²) or O(n log n) with binary search.
+
+---
+
+## System Design: Open-Ended
+
+1. **Design a real-time chat application.**
+   - **Messages:** Queue (RabbitMQ/Kafka) for async delivery.
+   - **Ordering:** Single queue per conversation guarantees order.
+   - **Live notification:** WebSocket or Server-Sent Events (SSE).
+   - **Persistence:** Store messages in DB, also write to cache for fast retrieval.
+   - **Scaling:** Shard by conversation ID.
+
+2. **Design a rate limiting service used by multiple teams.**
+   - Centralized Redis instance(s).
+   - Lua scripts for atomic updates.
+   - Support multiple strategies: token bucket, sliding window.
+   - Support multiple dimensions: per user, per API key, per IP.
+   - Dashboard to monitor and adjust limits.
+
+3. **Design a notification system (email, SMS, push).**
+   - Queue notifications.
+   - Workers consume, send via respective service (SendGrid, Twilio, Firebase).
+   - Retry logic, dead letter queue.
+   - Deduplication (don't send same notification twice).
+   - Unsubscribe/preference management.
+
+4. **Design a search system for billions of documents.**
+   - Crawl/ingest documents.
+   - Index in Elasticsearch (inverted index).
+   - Rank results (relevance, freshness, popularity).
+   - Cache frequent queries.
+   - Shard index across multiple Elasticsearch nodes.
+
+5. **Design a recommendation system.**
+   - Collect user behavior (views, clicks, purchases).
+   - Collaborative filtering: if users A and B have similar behavior, recommend B's items to A.
+   - Content-based: if user likes "comedy", recommend other comedy.
+   - ML model trained on historical data.
+
+---
+
+## Expected Answer Depth
+
+For **first round (first screening):** 
+- Basic understanding, code examples, complexity analysis.
+
+For **client round (final round):**
+- Deep dive: architecture, trade-offs, deployment considerations.
+- Be ready for follow-up questions: "What if load increases 10x?"
+- Mention real systems: "Like how Netflix handles concurrent viewers."
+- Discuss failure modes: "If this service goes down, what happens?"
+
+---
+
+**Good luck with your interview!**
+
+Now you're ready to tackle client round questions with confidence. Focus on clarity, showing your thought process, and not memorizing. Interviewers want to see HOW you think, not WHAT you memorize.
